@@ -1,0 +1,79 @@
+# adverse_media_app.py
+import requests, re, time
+import streamlit as st
+import spacy
+from rapidfuzz import fuzz
+from dateutil import parser as dparser
+
+# Load NER model
+nlp = spacy.load("en_core_web_sm")
+
+# Negative keywords & sanction countries
+NEGATIVE_KW = ["fraud","money laundering","corruption","bribery","terrorism","terrorist financing","sanctions"]
+SANCTION_COUNTRIES = ["Iran","Syria","North Korea","Cuba"]
+
+# Free GNews endpoint
+GNEWS_URL = "https://gnews.io/api/v4/search"
+GNEWS_KEY = "demo"  # replace with your free key from https://gnews.io
+
+# Normalize text
+def norm(text): return re.sub(r'\s+',' ', text.lower().strip())
+
+# DOB extractor
+DOB_RE = re.compile(r'(born|b\.)\s+([^\.,;]+)', re.I)
+def extract_dob(text):
+    m = DOB_RE.search(text)
+    if m:
+        try:
+            d = dparser.parse(m.group(2), fuzzy=True)
+            return d.date().isoformat()
+        except: return None
+    return None
+
+# Name match
+def name_score(target, mention):
+    t, m = norm(target), norm(mention)
+    return fuzz.token_set_ratio(t,m)/100.0
+
+# Risk scoring
+def severity(name_score, keyword_hits, sanctions_hit):
+    s = 0.3*name_score + 0.4*(len(keyword_hits)/3) + 0.3*(1 if sanctions_hit else 0)
+    if s >= 0.7: return "High"
+    elif s >= 0.4: return "Medium"
+    else: return "Low"
+
+# Search function
+def search_news(query):
+    params = {"q": query, "token": GNEWS_KEY, "lang":"en", "max":10}
+    r = requests.get(GNEWS_URL, params=params, timeout=15)
+    if r.status_code!=200: return []
+    return r.json().get("articles", [])
+
+# Streamlit UI
+st.title("🔎 Adverse Media Search Tool (Free)")
+
+name = st.text_input("Enter Individual / Entity / Vessel Name")
+if st.button("Search") and name:
+    query = f'"{name}" AND ({ " OR ".join(NEGATIVE_KW) })'
+    results = search_news(query)
+    
+    if not results:
+        st.warning("No news found.")
+    for art in results:
+        text = art["title"] + " " + art.get("description","")
+        doc = nlp(text)
+        persons = [ent.text for ent in doc.ents if ent.label_=="PERSON"]
+        n_score = max([name_score(name,p) for p in persons], default=0)
+        kw_hits = [k for k in NEGATIVE_KW if k in text.lower()]
+        sanc_hit = any(c.lower() in text.lower() for c in SANCTION_COUNTRIES)
+        dob = extract_dob(text)
+        level = severity(n_score, kw_hits, sanc_hit)
+        
+        st.subheader(art["title"])
+        st.write(f"📰 {art['source']['name']} | {art['publishedAt']}")
+        st.write(art["description"])
+        st.markdown(f"[Read more]({art['url']})")
+        st.write(f"**Severity:** {level}")
+        if dob: st.write(f"📅 Possible DOB found: {dob}")
+        if kw_hits: st.write(f"⚠️ Keywords: {', '.join(kw_hits)}")
+        st.write("---")
